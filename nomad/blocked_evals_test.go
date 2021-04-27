@@ -671,3 +671,39 @@ func TestBlockedEvals_SystemDisableFlush(t *testing.T) {
 	require.Empty(t, blocked.system.byJob)
 	require.Empty(t, blocked.system.byNode)
 }
+
+func TestBlockedEvals_BlockedResources(t *testing.T) {
+	t.Parallel()
+	blocked, _ := testBlockedEvals(t)
+
+	// Create eval blocked on memory and add it to the blocked tracker.
+	e := mock.Eval()
+	e.FailedTGAllocs = map[string]*structs.AllocMetric{
+		"example": {
+			DimensionExhausted: map[string]int{
+				"memory": 1,
+			},
+			ResourcesExhausted: map[string]*structs.Resources{
+				"example": {
+					CPU:      0,
+					MemoryMB: 128,
+				},
+			},
+		},
+	}
+	blocked.Block(e)
+
+	// Verify block did track.
+	bStats := blocked.Stats()
+	expected := BlockedResourcesStats{
+		ByJob: map[structs.NamespacedID]BlockedResourcesSummary{
+			structs.NewNamespacedID(e.JobID, e.Namespace): {
+				CPU:      0,
+				MemoryMB: 128,
+			},
+		},
+		ByDatacenter: map[string]BlockedResourcesSummary{},
+		ByNodeClass:  map[string]BlockedResourcesSummary{},
+	}
+	require.Equal(t, expected, bStats.BlockedResources)
+}

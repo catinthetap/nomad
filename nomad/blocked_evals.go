@@ -108,44 +108,170 @@ type BlockedStats struct {
 	// to the quota limit being reached.
 	TotalQuotaLimit int
 
-	TotalBlockedResources map[structs.NamespacedID]*BlockedResourcesStats
+	// BlockedResources stores the amount of resources requested by blocked
+	// evaluations.
+	BlockedResources BlockedResourcesStats
 }
 
-type BlockedResourcesStats struct {
-	TaskGroup string
-	Task      string
-	CPU       int
-	MemoryMB  int
-}
-
-func (b *BlockedStats) Block(eval *structs.Evaluation) {
-	b.TotalBlocked++
-
-	namespacedID := structs.NewNamespacedID(eval.JobID, eval.Namespace)
-	for _, v := range eval.FailedTGAllocs {
-		resources := b.TotalBlockedResources[namespacedID]
-		if resources == nil {
-			resources = &BlockedResourcesStats{}
-		}
-
-		for _, r := range v.ResourcesPending.Tasks {
-			resources.MemoryMB += r.MemoryMB
-			resources.CPU += r.CPU
-		}
-		b.TotalBlockedResources[namespacedID] = resources
+// NewBlockedStats returns a new BlockedStats.
+func NewBlockedStats() *BlockedStats {
+	return &BlockedStats{
+		BlockedResources: NewBlockedResourcesStats(),
 	}
 }
 
+// Block updates the stats for the blocked eval tracker with the details of the
+// evaluation being blocked.
+func (b *BlockedStats) Block(eval *structs.Evaluation) {
+	b.TotalBlocked++
+	resourceStats := generateResourceStats(eval)
+	b.BlockedResources = b.BlockedResources.Add(resourceStats)
+}
+
+// Unblock updates the stats for the blocked eval tracker with the details of the
+// evaluation being unblocked.
 func (b *BlockedStats) Unblock(eval *structs.Evaluation) {
 	b.TotalBlocked--
-	b.TotalBlockedResources[structs.NewNamespacedID(eval.JobID, eval.Namespace)] = &BlockedResourcesStats{}
+	resourceStats := generateResourceStats(eval)
+	b.BlockedResources = b.BlockedResources.Subtract(resourceStats)
+}
+
+// generateResourceStats returns a summary of the resources requested by the
+// input evaluation.
+func generateResourceStats(eval *structs.Evaluation) BlockedResourcesStats {
+	dcs := make(map[string]struct{})
+	classes := make(map[string]struct{})
+	resources := BlockedResourcesSummary{}
+
+	for _, allocMetrics := range eval.FailedTGAllocs {
+		for dc := range allocMetrics.NodesAvailable {
+			dcs[dc] = struct{}{}
+		}
+
+		for class := range allocMetrics.ClassExhausted {
+			classes[class] = struct{}{}
+		}
+
+		for _, r := range allocMetrics.ResourcesExhausted {
+			resources.CPU += r.CPU
+			resources.MemoryMB += r.MemoryMB
+		}
+	}
+
+	byJob := make(map[structs.NamespacedID]BlockedResourcesSummary)
+	byJob[structs.NewNamespacedID(eval.JobID, eval.Namespace)] = resources
+
+	byDatacenter := make(map[string]BlockedResourcesSummary)
+	for dc := range dcs {
+		byDatacenter[dc] = resources
+	}
+
+	byNodeClass := make(map[string]BlockedResourcesSummary)
+	for class := range classes {
+		byNodeClass[class] = resources
+	}
+
+	return BlockedResourcesStats{
+		ByJob:        byJob,
+		ByDatacenter: byDatacenter,
+		ByNodeClass:  byNodeClass,
+	}
+}
+
+// BlockedResourcesStats stores resources requested by block evaluations
+// split into different dimensions.
+type BlockedResourcesStats struct {
+	ByJob        map[structs.NamespacedID]BlockedResourcesSummary
+	ByDatacenter map[string]BlockedResourcesSummary
+	ByNodeClass  map[string]BlockedResourcesSummary
+}
+
+// NewBlockedResourcesStats returns a new BlockedResourcesStats.
+func NewBlockedResourcesStats() BlockedResourcesStats {
+	return BlockedResourcesStats{
+		ByJob:        make(map[structs.NamespacedID]BlockedResourcesSummary),
+		ByDatacenter: make(map[string]BlockedResourcesSummary),
+		ByNodeClass:  make(map[string]BlockedResourcesSummary),
+	}
+}
+
+// Copy returns a deep copy of the blocked resource stats.
+func (b BlockedResourcesStats) Copy() BlockedResourcesStats {
+	a := NewBlockedResourcesStats()
+	for k, v := range b.ByJob {
+		a.ByJob[k] = v
+	}
+	for k, v := range b.ByDatacenter {
+		a.ByDatacenter[k] = v
+	}
+	for k, v := range b.ByNodeClass {
+		a.ByNodeClass[k] = v
+	}
+	return a
+}
+
+func (b BlockedResourcesStats) Empty() bool {
+	return len(b.ByJob) == 0 &&
+		len(b.ByDatacenter) == 0 &&
+		len(b.ByNodeClass) == 0
+}
+
+// Add returns a new
+func (b BlockedResourcesStats) Add(a BlockedResourcesStats) BlockedResourcesStats {
+	result := b.Copy()
+
+	for k, v := range a.ByJob {
+		result.ByJob[k] = b.ByJob[k].Add(v)
+	}
+	for k, v := range a.ByDatacenter {
+		result.ByDatacenter[k] = b.ByDatacenter[k].Add(v)
+	}
+	for k, v := range a.ByNodeClass {
+		result.ByNodeClass[k] = b.ByNodeClass[k].Add(v)
+	}
+
+	return result
+}
+
+func (b BlockedResourcesStats) Subtract(a BlockedResourcesStats) BlockedResourcesStats {
+	result := b.Copy()
+
+	for k, v := range a.ByJob {
+		result.ByJob[k] = b.ByJob[k].Subtract(v)
+	}
+	for k, v := range a.ByDatacenter {
+		result.ByDatacenter[k] = b.ByDatacenter[k].Subtract(v)
+	}
+	for k, v := range a.ByNodeClass {
+		result.ByNodeClass[k] = b.ByNodeClass[k].Subtract(v)
+	}
+
+	return result
+}
+
+type BlockedResourcesSummary struct {
+	CPU      int
+	MemoryMB int
+}
+
+func (b BlockedResourcesSummary) Add(a BlockedResourcesSummary) BlockedResourcesSummary {
+	return BlockedResourcesSummary{
+		CPU:      b.CPU + a.CPU,
+		MemoryMB: b.MemoryMB + a.MemoryMB,
+	}
+}
+
+func (b BlockedResourcesSummary) Subtract(a BlockedResourcesSummary) BlockedResourcesSummary {
+	return BlockedResourcesSummary{
+		CPU:      b.CPU - a.CPU,
+		MemoryMB: b.MemoryMB - a.MemoryMB,
+	}
 }
 
 // NewBlockedEvals creates a new blocked eval tracker that will enqueue
 // unblocked evals into the passed broker.
 func NewBlockedEvals(evalBroker *EvalBroker, logger log.Logger) *BlockedEvals {
-	stats := new(BlockedStats)
-	stats.TotalBlockedResources = make(map[structs.NamespacedID]*BlockedResourcesStats)
+	stats := NewBlockedStats()
 
 	return &BlockedEvals{
 		logger:           logger.Named("blocked_evals"),
@@ -618,10 +744,13 @@ func (b *BlockedEvals) unblock(computedClass, quota string, index uint64) {
 		}
 	}
 
+	for eval := range unblocked {
+		b.stats.Unblock(eval)
+	}
+
 	if l := len(unblocked); l != 0 {
 		// Update the counters
 		b.stats.TotalEscaped = 0
-		b.stats.TotalBlocked -= l
 		b.stats.TotalQuotaLimit -= numQuotaLimit
 
 		// Enqueue all the unblocked evals into the broker.
@@ -665,8 +794,11 @@ func (b *BlockedEvals) UnblockFailed() {
 		}
 	}
 
+	for eval := range unblocked {
+		b.stats.Unblock(eval)
+	}
+
 	if l := len(unblocked); l > 0 {
-		b.stats.TotalBlocked -= l
 		b.stats.TotalQuotaLimit -= quotaLimit
 		b.evalBroker.EnqueueAll(unblocked)
 	}
@@ -718,6 +850,7 @@ func (b *BlockedEvals) Flush() {
 	b.stats.TotalEscaped = 0
 	b.stats.TotalBlocked = 0
 	b.stats.TotalQuotaLimit = 0
+	b.stats.BlockedResources = NewBlockedResourcesStats()
 	b.captured = make(map[string]wrappedEval)
 	b.escaped = make(map[string]wrappedEval)
 	b.jobs = make(map[structs.NamespacedID]string)
@@ -733,7 +866,7 @@ func (b *BlockedEvals) Flush() {
 // Stats is used to query the state of the blocked eval tracker.
 func (b *BlockedEvals) Stats() *BlockedStats {
 	// Allocate a new stats struct
-	stats := new(BlockedStats)
+	stats := NewBlockedStats()
 
 	b.l.RLock()
 	defer b.l.RUnlock()
@@ -742,14 +875,8 @@ func (b *BlockedEvals) Stats() *BlockedStats {
 	stats.TotalEscaped = b.stats.TotalEscaped
 	stats.TotalBlocked = b.stats.TotalBlocked
 	stats.TotalQuotaLimit = b.stats.TotalQuotaLimit
+	stats.BlockedResources = b.stats.BlockedResources.Copy()
 
-	stats.TotalBlockedResources = make(map[structs.NamespacedID]*BlockedResourcesStats)
-	for k, v := range b.stats.TotalBlockedResources {
-		stats.TotalBlockedResources[k] = &BlockedResourcesStats{
-			CPU:      v.CPU,
-			MemoryMB: v.MemoryMB,
-		}
-	}
 	return stats
 }
 
@@ -763,13 +890,27 @@ func (b *BlockedEvals) EmitStats(period time.Duration, stopCh <-chan struct{}) {
 			metrics.SetGauge([]string{"nomad", "blocked_evals", "total_blocked"}, float32(stats.TotalBlocked))
 			metrics.SetGauge([]string{"nomad", "blocked_evals", "total_escaped"}, float32(stats.TotalEscaped))
 
-			for k, v := range stats.TotalBlockedResources {
+			for k, v := range stats.BlockedResources.ByJob {
 				labels := []metrics.Label{
 					{Name: "namespace", Value: k.Namespace},
 					{Name: "job", Value: k.ID},
 				}
-				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "blocked_resources", "cpu"}, float32(v.CPU), labels)
-				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "blocked_resources", "memory"}, float32(v.MemoryMB), labels)
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "job", "cpu"}, float32(v.CPU), labels)
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "job", "memory"}, float32(v.MemoryMB), labels)
+			}
+			for k, v := range stats.BlockedResources.ByDatacenter {
+				labels := []metrics.Label{
+					{Name: "datacenter", Value: k},
+				}
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "datacenter", "cpu"}, float32(v.CPU), labels)
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "datacenter", "memory"}, float32(v.MemoryMB), labels)
+			}
+			for k, v := range stats.BlockedResources.ByNodeClass {
+				labels := []metrics.Label{
+					{Name: "node_class", Value: k},
+				}
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "node_class", "cpu"}, float32(v.CPU), labels)
+				metrics.SetGaugeWithLabels([]string{"nomad", "blocked_evals", "node_class", "memory"}, float32(v.MemoryMB), labels)
 			}
 		case <-stopCh:
 			return

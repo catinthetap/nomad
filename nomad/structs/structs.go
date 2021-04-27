@@ -9760,16 +9760,6 @@ func NewAllocStubFields() *AllocStubFields {
 	}
 }
 
-type AllocPendingResources struct {
-	Tasks map[string]Resources
-}
-
-func NewAllocPendingResources() *AllocPendingResources {
-	return &AllocPendingResources{
-		Tasks: make(map[string]Resources),
-	}
-}
-
 // AllocMetric is used to track various metrics while attempting
 // to make an allocation. These are used to debug a job, or to better
 // understand the pressure within the system.
@@ -9802,8 +9792,9 @@ type AllocMetric struct {
 	// QuotaExhausted provides the exhausted dimensions
 	QuotaExhausted []string
 
-	// ResourcesPending provides the amount of resource pending per task group and task
-	ResourcesPending *AllocPendingResources
+	// ResourcesExhausted provides the amount of resources exhausted by task
+	// during the allocation placement
+	ResourcesExhausted map[string]*Resources
 
 	// Scores is the scores of the final few nodes remaining
 	// for placement. The top score is typically selected.
@@ -9893,6 +9884,35 @@ func (a *AllocMetric) ExhaustQuota(dimensions []string) {
 	a.QuotaExhausted = append(a.QuotaExhausted, dimensions...)
 }
 
+// ExhaustResources updates the amount of resources exhausted for the
+// allocation because of the given task group.
+func (a *AllocMetric) ExhaustResources(tg *TaskGroup) {
+	if a.DimensionExhausted == nil {
+		return
+	}
+
+	if a.ResourcesExhausted == nil {
+		a.ResourcesExhausted = make(map[string]*Resources)
+	}
+
+	for _, t := range tg.Tasks {
+		exhaustedResources := a.ResourcesExhausted[t.Name]
+		if exhaustedResources == nil {
+			exhaustedResources = &Resources{}
+		}
+
+		if a.DimensionExhausted["memory"] > 0 {
+			exhaustedResources.MemoryMB += t.Resources.MemoryMB
+		}
+
+		if a.DimensionExhausted["cpu"] > 0 {
+			exhaustedResources.CPU += t.Resources.CPU
+		}
+
+		a.ResourcesExhausted[t.Name] = exhaustedResources
+	}
+}
+
 // ScoreNode is used to gather top K scoring nodes in a heap
 func (a *AllocMetric) ScoreNode(node *Node, name string, score float64) {
 	// Create nodeScoreMeta lazily if its the first time or if its a new node
@@ -9934,29 +9954,6 @@ func (a *AllocMetric) PopulateScoreMetaData() {
 	heapItems := a.topScores.GetItemsReverse()
 	for i, item := range heapItems {
 		a.ScoreMetaData[i] = item.(*NodeScoreMeta)
-	}
-}
-
-func (a *AllocMetric) BlockResources(tg *TaskGroup) {
-	if a.DimensionExhausted == nil {
-		return
-	}
-
-	if a.ResourcesPending == nil {
-		a.ResourcesPending = NewAllocPendingResources()
-	}
-
-	for _, t := range tg.Tasks {
-		pending := a.ResourcesPending.Tasks[t.Name]
-		if a.DimensionExhausted["memory"] > 0 {
-			pending.MemoryMB += t.Resources.MemoryMB
-		}
-
-		if a.DimensionExhausted["cpu"] > 0 {
-			pending.CPU += t.Resources.CPU
-		}
-
-		a.ResourcesPending.Tasks[t.Name] = pending
 	}
 }
 
@@ -10387,7 +10384,7 @@ func (e *Evaluation) NextRollingEval(wait time.Duration) *Evaluation {
 // ineligible, whether the job has escaped computed node classes and whether the
 // quota limit was reached.
 func (e *Evaluation) CreateBlockedEval(classEligibility map[string]bool,
-	escaped bool, quotaReached string) *Evaluation {
+	escaped bool, quotaReached string, failedTGAllocs map[string]*AllocMetric) *Evaluation {
 	now := time.Now().UTC().UnixNano()
 	return &Evaluation{
 		ID:                   uuid.Generate(),
@@ -10399,6 +10396,7 @@ func (e *Evaluation) CreateBlockedEval(classEligibility map[string]bool,
 		JobModifyIndex:       e.JobModifyIndex,
 		Status:               EvalStatusBlocked,
 		PreviousEval:         e.ID,
+		FailedTGAllocs:       failedTGAllocs,
 		ClassEligibility:     classEligibility,
 		EscapedComputedClass: escaped,
 		QuotaLimitReached:    quotaReached,
